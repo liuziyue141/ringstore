@@ -7,21 +7,29 @@ The interesting part is the handoff. A replacement backend starts with empty mem
 ## Architecture at a glance
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 40, "rankSpacing": 100}}}%%
 flowchart LR
-    C[Client: hash bin and walk clockwise]
-    K[Keeper: scan, merge, copy missing IDs]
-    B1[Backend A: operation logs + clock floor]
-    B2[Backend B: operation logs + clock floor]
-    B3[Backend C: operation logs + clock floor]
-    B4[Backend D: replacement or retained holder]
-    C -->|normal writes| B1
-    C -->|normal writes| B2
-    C -->|normal writes| B3
-    C -.->|merged reads include retained holders| B4
-    K -->|anti-entropy repair| B1
-    K -->|anti-entropy repair| B2
-    K -->|anti-entropy repair| B3
-    K -->|scan / repair after placement changes| B4
+    C["<b>Client</b><br/>hash bin, walk clockwise"]
+
+    subgraph BE["Backends"]
+        direction TB
+        B1["<b>Backend A</b><br/>operation logs + clock floor"]
+        B2["<b>Backend B</b><br/>operation logs + clock floor"]
+        B3["<b>Backend C</b><br/>operation logs + clock floor"]
+        B4["<b>Backend D</b><br/>replacement or retained holder"]
+    end
+
+    K["<b>Keeper</b><br/>scan, merge, copy missing IDs"]
+
+    C -->|"normal writes"| B1
+    C -->|"normal writes"| B2
+    C -->|"normal writes"| B3
+    C -.->|"merged reads include retained holders"| B4
+
+    B1 <-->|"anti-entropy repair"| K
+    B2 <--> K
+    B3 <--> K
+    B4 <-->|"scan / repair after placement changes"| K
 ```
 
 Every client and keeper receives the same configured backend addresses. Each independently hashes normalized `host:port`, hashes the bin name, finds its successor, and walks clockwise until three distinct reachable backends accept the write. Fewer live backends means fewer copies. There is one ring position per configured endpoint and no routing-table service.
