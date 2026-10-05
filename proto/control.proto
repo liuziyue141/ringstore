@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package control;
+
+service Keeper {
+    rpc HeartBeat (Empty) returns (KeeperInfo);
+}
+
+// Backend-only metadata. Frontends never contact keepers.
+service BackendControl {
+    rpc Inspect (Empty) returns (BackendInfo);
+    rpc AdvanceClock (ClockFloor) returns (Empty);
+}
+
+message BackendInfo {
+    string incarnation = 1;
+    uint64 clock_floor = 2;
+}
+
+message ClockFloor {
+    uint64 value = 1;
+}
+
+message Empty {
+
+}
+
+message KeeperInfo {
+    string addr = 1;
+    uint64 id_1 = 2;
+    uint64 id_2 = 3;
+    uint32 this = 4;
+}

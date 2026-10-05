@@ -1,0 +1,24 @@
+[package]
+name = "ringstore"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A small replicated bin store with restartable anti-entropy repair"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+prost = "0.13"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.12"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"

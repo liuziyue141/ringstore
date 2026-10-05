@@ -1,0 +1,25 @@
+name: Rust checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Check lints
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Run unit, process fault, and documentation tests
+        run: cargo +stable test --locked --all-targets && cargo +stable test --locked --doc
+      - name: Run CLI crash demonstration
+        run: cargo +stable build --locked --bin ringstore && python3 scripts/demo.py
