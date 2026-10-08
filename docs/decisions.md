@@ -1,29 +1,45 @@
 # Design decisions
 
-## Compute placement locally
+Each section is a choice we made, the simpler-looking alternative, and why we did not take it.
 
-Clients and keepers already share static configuration. A lookup service adds another state transfer and availability dependency. Both compute the same ring and walk it directly. One position per endpoint keeps the implementation small; virtual nodes and load-balancing claims are deferred.
+## Compute placement on the client, not with a lookup service
 
-## Use identity, not a hash of the value
+**Alternative:** a service that tells clients which backends own a bin.
 
-Two equal appends are distinct mutations. One mutation delivered twice is one mutation. A random operation ID represents that distinction, and logical timestamps plus IDs define a stable order. An ID is reused across every delivery of the ongoing call. Caller-level retries after a crash are separate calls.
+**Why not:** every process already has the same config. Hashing locally gives the same answer everywhere with no extra service to keep alive or in sync. We use one ring position per backend to keep the code small; virtual nodes and load-balancing tuning are left out.
 
-## Reconstruct repair instead of checkpointing phases
+## Give each operation a random ID, not a hash of its value
 
-A keeper-local phase or cursor vanishes on process failure. Surviving backend logs provide the source of truth: merge them and compute missing IDs. Copy work can repeat safely, so leadership is an efficiency choice rather than a correctness requirement. Full log scans cost bandwidth and memory but make recovery inspectable.
+**Alternative:** identify an entry by hashing its contents.
 
-## Retain old copies and read them
+**Why not:** two real `append("paid")` calls are two operations and must both count, but one operation delivered twice must count once. A random ID created per call (and reused on that call's retries) tells these apart. A content hash would merge the two real appends. Order comes from `(timestamp, id)`.
 
-Restricting reads to the new three targets can hide data while those targets are still empty. Retained holders remain readable until a future safe cleanup protocol exists. This increases fanout and storage consumption; the repository states that cost instead of implying three physical copies at all times.
+## Recompute repair each pass, instead of saving progress
 
-## Record removals as identities
+**Alternative:** the keeper records how far it got ("copied keys 1 to 500 to backend D") and resumes from there.
 
-Physically removing list values permits an old replica to reintroduce them. A removal names the append IDs it observed. Late copies of those IDs remain hidden, while an equal append with a new ID survives. Tombstone cleanup needs evidence that old holders cannot return obsolete histories.
+**Why not:** that record lives in the keeper's memory and disappears when the keeper crashes. The backends' logs already contain everything needed. Each pass merges them and copies only missing IDs, so redoing work is harmless, and any keeper can pick up after another. The cost is reading full logs every pass.
+
+## Keep old copies and read from every backend
+
+**Alternative:** read only from the current 3 owners and delete copies from old owners.
+
+**Why not:** right after a failure, a new owner may still be empty. Reading only the owners would make data look missing until the keeper catches up. Reading every backend always finds the data. The cost is more read traffic and more than three copies of some keys, until a safe cleanup protocol exists.
+
+## Remove list items by ID, not by deleting entries
+
+**Alternative:** physically delete the matching appends from the log.
+
+**Why not:** an old backend that still has the append would copy it back during repair. Instead, a remove names the append IDs it saw. A late copy of one of those appends stays hidden, and a new equal append (new ID) survives. Single values use a delete marker for the same reason. Cleaning these up would require knowing no old copy can come back.
 
 ## Keep the clock outside user keys
 
-Backend incarnation and clock-floor metadata are process state exposed through a backend-only service. They do not reserve a user-visible bin/key and do not depend on keeper availability. Fixed numeric slots separate allocator counters. This assumes fixed membership and surviving floor holders; it does not solve partition-safe sequencing.
+**Alternative:** store the clock in a reserved bin or key.
 
-## Test actual process loss
+**Why not:** that would take over a name users might want, and mix system data with user data. Instead, each backend keeps its counter, restart ID, and highest clock value as process state, exposed through a backend-only service. Fixed slots keep backends from handing out the same value. This relies on fixed membership and on some backend surviving to remember the highest value.
 
-Cancelling a repair future alone can leave sockets, runtime tasks, or shared memory alive. Integration tests spawn a child executable for each service and kill the process. A copy barrier forces a known partial migration. Dynamic reserved ports and bounded polling isolate tests without relying on lucky fixed sleeps.
+## Test by killing real processes
+
+**Alternative:** simulate a crash by cancelling a task inside one test process.
+
+**Why not:** a cancelled task can leave sockets, background tasks, or shared memory alive, which hides real bugs. The fault tests start each backend and keeper as a separate process and kill it. A backend that pauses after one copied entry lets a test kill the keeper at a known point mid-copy. Tests pick free ports and poll for results instead of sleeping for fixed times.

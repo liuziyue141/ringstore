@@ -1,80 +1,125 @@
 # Architecture
 
+This document goes one level deeper than the [README](../README.md). It follows the same order: placement, the log, writes, reads, log migration, and the logical clock.
+
 ## Goal and failure model
 
-Ringstore provides named bins of scalar and list keys. Its focus is recovering replicated state when a backend loses all memory or a keeper dies during migration.
+Ringstore stores named **bins**. Each bin holds two kinds of keys: single values (`set` / `get`) and lists (`append` / `list` / `remove`). The goal is to keep data available when a backend crashes and loses all its memory, or when a keeper dies in the middle of copying data.
 
-The supported model has a fixed list of configured endpoints, a reliable network, and crash-stop/restart process failures. A failed connection is treated as a crashed process, rather than a partition. Restarts use the same address with fresh memory and a new incarnation ID. At least one backend is available; replication safety depends on maintaining at least three and allowing repair between successive backend failures. The source lab assumed backend events at least 30 seconds apart and whole-backend copying under 20 seconds. Those are model assumptions, not measured throughput guarantees of this repository.
+What the design assumes:
 
-Membership reconfiguration, partitions, simultaneous loss of all holders, Byzantine processes, disk persistence, and transactions are outside this model.
+- **Fixed membership.** Every process reads the same list of backend and keeper addresses. Adding or removing backends at runtime is not supported.
+- **Crash and restart only.** A process either works correctly or is dead. A restarted backend comes back at the same address with empty memory.
+- **Reliable network.** A failed connection means the process is dead, not that the network is split.
+- **One failure at a time.** After a backend fails, the keeper has time to restore three copies before the next failure. The original lab assumed at least 30 seconds between backend events and under 20 seconds to copy a backend's data. Those numbers come from the lab, not from measurements of this repository.
 
-## Components and boundaries
+Not handled: network partitions, losing every holder of a key at once, malicious processes, disk persistence, and transactions.
 
-| Component | Owns | Does not need |
+## Components
+
+| Component | Keeps | Does not need |
 | --- | --- | --- |
-| Client | Ring, cached RPC channels, current call's operation identity | Keeper address or routing information |
-| Backend | In-memory raw storage, atomic counter, incarnation, monotone clock floor | Other backend addresses |
-| Keeper | Ring, keeper addresses/index, one reconciliation pass | A durable migration cursor or frontend connection |
+| Client | The ring, cached gRPC connections | The keeper |
+| Backend | Key logs in memory, a clock counter, a restart ID, the highest clock value seen | Other backends' addresses |
+| Keeper | The ring, the keeper list and its own index | Any saved progress |
 
-[storage.proto](../proto/storage.proto) defines raw scalar/list/clock RPCs. [control.proto](../proto/control.proto) defines backend inspection, clock-floor advancement, and keeper heartbeats. Backend metadata lives outside user key spaces. Frontends contact backends directly; only keepers probe keeper heartbeats.
+- [storage.proto](../proto/storage.proto) defines the raw storage and clock calls a backend serves.
+- [control.proto](../proto/control.proto) defines backend status (restart ID, highest clock value), pushing the highest clock value, and keeper heartbeats.
 
-Readiness follows a successful bind. A keeper also completes its initial reconciliation before signalling readiness. Its server and worker futures share a lifetime; owned `JoinSet`s abort their work when dropped.
+Clients talk only to backends. Only keepers ping other keepers.
+
+The **restart ID** is a random value a backend picks when it starts. A backend that crashed and came back at the same address has a new restart ID, so other processes can tell it is a fresh, empty process.
 
 ## Placement
 
-Normalize each configured endpoint as `http://host:port`, lowercase its authority, and deduplicate matching normalized strings. The hash input for a node is its `host:port`; the hash input for a bin is its unencoded name. A specified FNV-1a hash followed by a fixed avalanche step ensures all processes use the same mapping. Hash collisions have an address tie-breaker.
+1. **Normalize addresses.** Each configured backend becomes `http://host:port` in lowercase. Duplicates are removed.
+2. **Hash backends.** Hash each `host:port` to a 64-bit position on the ring (FNV-1a plus a fixed mixing step, in [ring.rs](../src/ring.rs)). Every process uses the same function, so every process builds the same ring. If two hashes collide, the address breaks the tie.
+3. **Hash the bin.** Hash the bin name onto the same ring.
+4. **Walk clockwise.** Start at the first backend at or after the bin's position, wrapping around the end of the ring. Visit each backend once. The first 3 live backends are the bin's **owners**.
 
-The bin's successor is the first node at or after its hash, wrapping around if necessary. Walk clockwise once, skipping unsuccessful backend RPCs, until three distinct endpoints accept the operation. This iterator is computed locally; no persisted preference list is needed. One endpoint has one ring position. DNS aliases are not resolved into a shared physical-node identity, so configurations must not list aliases for the same backend process.
+Each backend has exactly one ring position; there are no virtual nodes. DNS aliases are not resolved, so do not list the same backend under two names.
 
-The configured membership is identical everywhere. Changing the configuration can change clock slots as well as ownership and is not a supported rolling-reconfiguration protocol.
+Because the clockwise walk is computed locally, there is no routing table to store or keep in sync. Changing the config changes the ring (and the clock slots below), so it is not a supported runtime operation.
 
-## Operation model
+### Key names on a backend
 
-Each JSON entry contains:
+Backends store raw keys of the form:
+
+```text
+ringstore::v1::{bin}::{scalar|list}::{key}
+```
+
+Bin and key names are escaped, so a `::` inside a name cannot be confused with the separator. Single-value keys and list keys live in separate namespaces even when they have the same name.
+
+## The log and replay
+
+Every key is a log of operations, stored as JSON entries:
 
 ```text
 Operation {
-    id: random 128-bit identity, encoded as hex,
-    timestamp: u128 logical timestamp,
-    action: Set(value) | Append(value) | Remove(observed_append_ids)
+    id:        random 128-bit value, as hex
+    timestamp: logical clock value
+    action:    Set(value) | Append(value) | Remove([append ids])
 }
 ```
 
-An encoded key has the shape `ringstore::v1::{escaped bin}::{scalar|list}::{escaped key}`. Escaping makes delimiters unambiguous, and scalar and list namespaces remain separate.
+**Merging.** To combine copies of a log from several backends, take the union of their entries by ID, then sort by `(timestamp, id)`. Two entries with the same ID but different contents is an error. The order in which logs are merged does not matter, and merging the same log twice changes nothing. So any backends holding the same set of IDs end up with the same sorted log.
 
-Merge unions operations by ID, rejects conflicting contents for an ID, and sorts by `(timestamp, id)`. Union is associative, commutative, and idempotent for valid histories. Sorting gives one deterministic projection once replicas hold the same operation set. Equal contents have different identities when they are distinct calls; duplicate network delivery reuses the original identity.
+**Replay.**
 
-Scalars project the newest set. An empty set is a deletion tombstone, retained in the log. Lists project surviving append IDs in sorted order. A remove contains the matching append IDs observed by its read; all those IDs are hidden even if their append entries arrive later. A concurrent append not observed by the remove survives. Concurrent removes may each count the same observed occurrence.
+- **Single value:** the last entry wins. If it is `Set("")`, the key is deleted. This delete marker stays in the log, so an old copy of an earlier `Set` cannot bring the value back.
+- **List:** start with every `Append`, then hide every append ID named by any `Remove`. Remaining items appear in log order.
 
-This is an observed-removal design inspired by convergent data types. The repository checks merge laws and representative schedules; it is not a formal verification of a general-purpose CRDT framework.
+**Why removes name IDs.** A `remove(key, "paid")` call first reads the list, collects the IDs of the `"paid"` appends it can see, and writes `Remove([those IDs])`. As a result:
 
-## Write protocol
+- If one of those appends reaches a backend late, after the remove, it is still hidden, because its ID is in the remove.
+- An `append("paid")` that the remove did not see has a new ID, so it survives.
+- Two concurrent removes may each report the same item as removed.
 
-1. Allocate a logical timestamp and create one operation ID.
-2. Walk clockwise. Inspect the candidate incarnation, read its existing log, and append the missing operation.
-3. Record the address and incarnation of each successful destination; stop after three, or finish the ring when fewer exist.
-4. Inspect reachable nodes again and compute the current first three targets.
-5. Return only when those targets match the successfully copied incarnations. Otherwise retry the same operation identity.
+**Why IDs are random, not a hash of the value.** Two real `append("paid")` calls are two different operations and both must count. Delivering one operation twice must count once. A random ID created per call gives exactly that. Hashing the value would merge the two real appends into one.
 
-An acknowledgement lost after an append can lead to repeated physical entries. Merge still applies the operation once. This provides idempotent delivery within an ongoing call and repair; a caller retrying an entire API call after its own crash creates a new ID and can append again. There is no durable caller-supplied idempotency token.
+## Write path
 
-Incarnation rechecks prevent address reuse alone from being mistaken for successful delivery to the replacement process. They are sampled observations under the supported failure model, not consensus or an atomic membership snapshot.
+1. Ask for a clock value (see [Logical clock](#logical-clock)) and create one operation with a new random ID.
+2. Walk the ring clockwise from the bin's position.
+3. At each backend: read its current log for the key and append the operation if its ID is missing. If the backend does not answer, skip it.
+4. Stop after 3 successful backends, or after visiting every backend if fewer than 3 are alive.
 
-## Reads and enumeration
+If the reply to an append is lost, the same operation can be stored twice on a backend. That is harmless, because merge keeps one entry per ID.
 
-Read all configured endpoints concurrently, retain successful log responses, merge by ID, and project. This includes old holders after placement changes. A fresh target can be reachable but empty; trusting only that target would lose sight of the retained history before repair finishes.
+This protects retries *inside* one call. If the caller itself crashes and calls `append` again, that second call gets a new ID and appends again. There is no caller-supplied idempotency key.
 
-Scalar reads copy the newest set, including deletion tombstones, to current targets before returning. List reads merge without a writeback; periodic keeper repair fills missing histories. Key enumeration unions encoded candidate keys, decodes logical names, applies prefix/suffix matching, and excludes empty projected state. Enumeration across multiple keys is not a transactional snapshot.
+## Read path
 
-Connection attempts have a 300 ms deadline; backend RPCs have a 25 second deadline. Unsuccessful availability sweeps back off 25 ms and retry. If no backend ever becomes available, storage calls keep waiting; callers may wrap calls in a timeout. Owned tasks are cancelled when the enclosing request future is dropped. Broad reads make latency sensitive to the slowest endpoint deadline.
+1. Ask **every** configured backend for the key's log at the same time.
+2. Merge the logs that come back and replay.
 
-## Restartable anti-entropy
+Reading every backend, not just the current owners, matters during recovery. A backend that just restarted is an owner but is still empty. If reads trusted only the owners, data would look missing until the keeper copied it over.
 
-Each keeper's initial pass runs unconditionally. Later passes run once per second when no lower-index keeper answers a heartbeat. This limits duplicate scans. It does not establish an exclusive leader: multiple keepers can repair concurrently without changing logical results.
+- **Single-value reads** also copy the newest entry (including a delete marker) to the current owners before returning, so the value you just read does not depend on one surviving copy.
+- **List reads** do not write back; the keeper fills in missing entries.
+- **Listing keys** collects raw key names from all backends, keeps the ones for this bin and kind, matches the prefix or suffix, and drops keys whose replayed value is empty. The result is not a consistent snapshot across keys.
 
-A pass discovers reachable backends, scans their retained logs, merges the histories for each key, computes the current targets, and copies missing IDs. Destination copies run across backends concurrently. Partial backend scans or destination failures are retried on later passes. Backend clock floors are also synchronized.
+**Timeouts.** Connecting to a backend times out after 300 ms; a backend call times out after 25 seconds. If no backend answers, the client waits 25 ms and tries again, forever. Wrap calls in your own timeout if you need one. Since reads ask every backend, a slow backend slows down every read.
 
-Example: source contains `{a,b,c}`, destination accepts `{a}`, and the keeper crashes. The replacement keeper rescans both histories and computes `{a,b,c} - {a} = {b,c}`. It needs no cursor. If `a` was appended but the response was lost, a repeat still produces one logical occurrence.
+## Log migration
+
+Log migration is how the keeper restores three copies after a failure. It is in `reconcile` in [keeper.rs](../src/keeper.rs).
+
+**When it runs.** Each keeper runs one pass at startup. After that, about once per second, it pings every keeper with a lower index. If one answers, it skips the round; otherwise it runs a pass. This keeps normally one keeper busy, but it is not a strict leader election. Two keepers running at once is safe, as explained below.
+
+**One pass:**
+
+1. **Find live backends** and their highest clock values.
+2. **Read every log.** For each live backend, at the same time, list all its keys and read each key's log. If a backend dies during this step, skip it; the other copies cover it, and the next pass catches anything new.
+3. **Sync the clock.** Take the highest clock value seen across backends and entries, and push it to every backend.
+4. **Merge** the copies of each key's log by ID.
+5. **Find owners.** For each key, walk the ring and take the first 3 live backends.
+6. **Copy the diff.** For each owner, read what it already has, compute `merged log - owner's log` by ID, and append only the missing entries. Different backends are filled in parallel. If a copy fails, log it and let the next pass retry.
+
+**Why no saved progress is needed.** Everything the keeper needs is in the backends' logs. Each pass recomputes the work from scratch, and copying is "add missing IDs only," so redoing it is harmless.
+
+Example: a surviving backend has `{a, b, c}`, a fresh backend has received only `{a}`, and the keeper crashes. The backup keeper reads both, computes `{a, b, c} - {a} = {b, c}`, and copies just those. If `a` had actually been appended twice because a reply was lost, merge still counts it once.
 
 ```mermaid
 sequenceDiagram
@@ -84,39 +129,61 @@ sequenceDiagram
     participant K2 as Keeper 1
     K1->>S: Read {a,b,c}
     K1->>D: Copy a
-    Note over K1: Process crashes during copy
+    Note over K1: Keeper 0 crashes mid-copy
     K2->>S: Read {a,b,c}
     K2->>D: Read {a}
     K2->>D: Copy missing {b,c}
-    Note over D: Projection contains each ID once
+    Note over D: Each ID counted once
 ```
 
-Retained copies are not removed after handoff. This lets a new keeper rediscover work from backend state, but the eventual physical replica count can exceed three.
+**Extra copies.** After the owners change, the keeper does not delete the old copies. Reads still see them and they do no harm, but a key can end up on more than three backends.
 
-## Logical clock and restart
+## Logical clock
 
-For `N` configured endpoints, a backend in deterministic slot `i` allocates values of the form `counter * N + i`. Atomic raw backend clocks prevent collision within a process; slots separate concurrent allocators. A client observes the maximum reachable floor, chooses a counter that respects that floor and the requested lower bound, publishes the resulting floor to reachable backends, and rechecks its allocator's incarnation before returning. A changed incarnation causes retry.
+The clock orders operations in the log. It is a counter, not wall-clock time.
 
-Floors are ephemeral but replicated. Recovery relies on surviving processes, just as operation recovery does. This is a logical allocation protocol, not wall-clock synchronization, a vector clock, or a partition-safe sequencer. Concurrent replies can arrive out of numeric order. Sequential calls observe completed floors and advance.
+**Avoiding duplicate values.** With `N` configured backends, backend number `i` (its slot) only hands out values `counter * N + i`. With 4 backends:
 
-Arithmetic widens before multiplying and saturates at `u64::MAX`, where public-clock repetition is allowed. Operation timestamps are `u128`; after public saturation, a mutation reads the merged per-key timestamp and advances it, preserving sequential scalar/list mutation order.
-
-## Invariants and evidence
-
-| Invariant | Evidence |
+| Backend | Values |
 | --- | --- |
-| Identical membership gives identical ring order; endpoints are visited once. | Ring normalization/order tests |
-| Repeated delivery of one ID cannot create a second logical append. | Operation merge tests and injected duplicate RPC delivery |
-| Two intentional equal appends remain distinct. | Process fault tests and demo |
-| A removed observed ID stays removed after late delivery. | Operation tests and process-level list removal |
-| Replacement keeper can reconstruct partial-copy work. | Child-process kill at a deterministic migration barrier |
-| Backend restart is detected despite address reuse. | Empty replacement repair and allocator restart tests |
-| Concurrent completed appends have one final order across clients. | 24 concurrent appends and fresh-client comparisons |
+| 0 | 0, 4, 8, 12, ... |
+| 1 | 1, 5, 9, 13, ... |
+| 2 | 2, 6, 10, 14, ... |
 
-See [testing.md](testing.md) for commands and test names. Tests establish the exercised schedules; they do not constitute a proof over arbitrary executions.
+Each backend's counter is atomic, so one backend never repeats a value, and different backends never overlap.
+
+**Getting a clock value** (`clock` in [replication.rs](../src/replication.rs)):
+
+1. Ask live backends for their highest clock value seen, and take the maximum.
+2. Pick the first live backend on the ring and ask it for a value above that maximum.
+3. Push the new value to every backend as the highest value seen.
+4. Check that the backend that handed out the value still has the same restart ID. If it restarted, start over.
+
+**Surviving restarts.** The highest-value-seen is kept only in memory, but it is copied to every backend, and the keeper pushes it again each pass. A restarted backend's counter starts at zero, but clients always ask for a value above the maximum the surviving backends remember. So a write that starts after another write has finished always gets a larger value.
+
+Concurrent calls can finish in a different order than their values. That is fine: the log only needs some fixed order, and `(timestamp, id)` provides it.
+
+**Overflow.** Clock values stop at `u64::MAX` instead of wrapping. Log timestamps are `u128`, so after the clock hits the maximum, a write reads the key's last timestamp and uses one more. Writes to the same key keep their order.
+
+## What the tests show
+
+| Property | Checked by |
+| --- | --- |
+| Every process builds the same ring and visits each backend once. | Ring unit tests |
+| Delivering the same operation twice counts once. | Merge unit tests and a duplicated-call fault test |
+| Two real equal appends both count. | Fault tests and demo |
+| A removed item stays removed even if its append arrives late. | Merge unit tests and a process-level remove test |
+| A backup keeper finishes a copy that a crashed keeper started. | Fault test that kills the keeper at a fixed point mid-copy |
+| A backend restarted at the same address is refilled. | Empty-restart and clock-restart fault tests |
+| Concurrent appends from different clients end in one order. | 24 concurrent appends compared from fresh clients |
+
+See [testing.md](testing.md) for commands and test names. These tests cover the specific failure sequences listed; they are not a proof for every possible sequence.
 
 ## Limits and future work
 
-All histories and tombstones grow without bound. Reads scan every configured endpoint, key enumeration projects each candidate, and repair reads full logs before computing differences. The default gRPC decoding limit is 4 MiB per message; large histories need chunked retrieval/copy or explicit bounds. No large-volume throughput or repair-time guarantee has been measured.
+- **Logs and delete markers grow forever.** Nothing is compacted.
+- **Work grows with data.** Reads ask every backend, listing keys replays every candidate, and each keeper pass reads full logs.
+- **Message size.** gRPC's default 4 MiB message limit caps how large one key's log can be.
+- **No performance numbers.** Throughput and repair time have not been measured.
 
-Useful next steps are bounded/chunked log RPCs, backend-side atomic append-if-absent, safe compaction with a handoff protocol, controlled benchmarks, durable caller idempotency tokens, and an explicit membership reconfiguration design. Disk persistence, TLS/authentication, partition tolerance, and quorum/consensus semantics would require additional protocols and tests. The current backend transport is plaintext and intended for local experiments.
+Possible next steps: read and copy logs in chunks, let backends do append-if-missing themselves, safe cleanup of old copies and delete markers, benchmarks, caller-supplied idempotency keys, and runtime membership changes. Disk persistence, TLS and authentication, partition tolerance, and quorum or consensus would each need new protocols and tests. Backend traffic is plaintext and meant for local use.
